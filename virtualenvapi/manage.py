@@ -1,42 +1,38 @@
-from os import linesep, environ
+from os import linesep
 import os.path
 import subprocess
 import six
 
-from virtualenvapi.util import split_package_name, to_text, get_env_path, to_ascii
 from virtualenvapi.exceptions import *
+from virtualenvapi.pip import PipWrapper
+from virtualenvapi.util import split_package_name, to_text, get_env_path, to_ascii
 
 
 class VirtualEnvironment(object):
+    """
+    Represents a virtual environment as managed by virtualenv and pip.
+    """
 
     def __init__(self, path=None, python=None, cache=None):
 
         if path is None:
             path = get_env_path()
-
         if not path:
             raise VirtualenvPathNotFound('Path for virtualenv is not define or virtualenv is not activate')
-
-        self.python = python
-
         # remove trailing slash so os.path.split() behaves correctly
         if path[-1] == os.path.sep:
             path = path[:-1]
         self.path = path
-        self.env = environ.copy()
-        if cache is not None:
-            self.env['PIP_DOWNLOAD_CACHE'] = os.path.expanduser(os.path.expandvars(cache))
+
+        self.pip = PipWrapper(self.path, cache=cache)
+
+        self.python = python
 
         # True if the virtual environment has been set up through open_or_create()
         self._ready = False
 
     def __str__(self):
         return six.u(self.path)
-
-    @property
-    def _pip_rpath(self):
-        """The relative path (from environment root) to pip."""
-        return os.path.join('bin', 'pip')
 
     @property
     def root(self):
@@ -72,39 +68,6 @@ class VirtualEnvironment(object):
         self._write_to_log(output, truncate=True)
         self._write_to_error(error, truncate=True)
 
-    def _execute(self, args, log=True):
-        """Executes the given command inside the environment and returns the output."""
-        if not self._ready:
-            self.open_or_create()
-        output = ''
-        error = ''
-        try:
-            if args[0] == 'pip':
-                args += ['--disable-pip-version-check']
-            proc = subprocess.Popen(args, cwd=self.path, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            output, error = proc.communicate()
-            returncode = proc.returncode
-            if returncode:
-                raise subprocess.CalledProcessError(returncode, proc, (output, error))
-            return to_text(output)
-        except OSError as e:
-            # raise a more meaningful error with the program name
-            prog = args[0]
-            if prog[0] != os.sep:
-                prog = os.path.join(self.path, prog)
-            raise OSError('%s: %s' % (prog, six.u(e)))
-        except subprocess.CalledProcessError as e:
-            output, error = e.output
-            e.output = output
-            raise e
-        finally:
-            if log:
-                try:
-                    self._write_to_log(to_text(output))
-                    self._write_to_error(to_text(error))
-                except NameError:
-                    pass  # We tried
-
     def _write_to_log(self, s, truncate=False):
         """Writes the given output to the log file, appending unless `truncate` is True."""
         # if truncate is True, set write mode to truncate
@@ -117,16 +80,22 @@ class VirtualEnvironment(object):
         with open(self._errorfile, 'w' if truncate else 'a') as fp:
             fp.writelines((to_text(s)), )
 
+    def log(self, stdout, stderr):
+        """Writes the output of a command to the logs."""
+        self._write_to_log(stdout)
+        self._write_to_error(stderr)
+
     def _pip_exists(self):
         """Returns True if pip exists inside the virtual environment. Can be
-        used as a naive way to verify that the environment is installed."""
-        return os.path.isfile(os.path.join(self.path, self._pip_rpath))
+        used as a naive way to verify that the environment is installed.
+        DEPRECATED: please use self.pip.exists() instead."""
+        return self.pip.exists()
 
     def open_or_create(self):
         """Attempts to open the virtual environment or creates it if it
         doesn't exist.
         XXX this should probably be expanded to do some proper checking?"""
-        if not self._pip_exists():
+        if not self.pip.exists():
             self._create()
         self._ready = True
 
@@ -159,10 +128,7 @@ class VirtualEnvironment(object):
                 options += ['--force-reinstall']
         elif force:
             options += ['--ignore-installed']
-        try:
-            self._execute([self._pip_rpath, 'install', package] + options)
-        except subprocess.CalledProcessError as e:
-            raise PackageInstallationException((e.returncode, e.output, package))
+        self.log(*self.pip.install(package, options))
 
     def uninstall(self, package):
         """Uninstalls the given package (given in pip's package syntax or a tuple of
@@ -172,10 +138,7 @@ class VirtualEnvironment(object):
         if not self.is_installed(package):
             self._write_to_log('%s is not installed, skipping' % package)
             return
-        try:
-            self._execute([self._pip_rpath, 'uninstall', '-y', package])
-        except subprocess.CalledProcessError as e:
-            raise PackageRemovalException((e.returncode, e.output, package))
+        self.log(*self.pip.uninstall(package))
 
     def wheel(self, package, options=None):
         """Creates a wheel of the given package from this virtual environment, 
@@ -196,10 +159,7 @@ class VirtualEnvironment(object):
             raise PackageWheelException((0, "Wheel package must be installed in the virtual environment", package))
         if not isinstance(options, list):
             raise ValueError("Options must be a list of strings.")
-        try:
-            self._execute([self._pip_rpath, 'wheel', package] + options)
-        except subprocess.CalledProcessError as e:
-            raise PackageWheelException((e.returncode, e.output, package))
+        self.log(*self.pip.wheel(package, options))
 
     def is_installed(self, package):
         """Returns True if the given package (given in pip's package syntax or a
@@ -228,21 +188,7 @@ class VirtualEnvironment(object):
 
         New in 2.1.5: returns a dictionary instead of list of tuples
         """
-        packages = {}
-        results = self._execute([self._pip_rpath, 'search', term], log=False)  # Don't want to log searches
-        for result in results.split(linesep):
-            try:
-                name, description = result.split(six.u(' - '), 1)
-            except ValueError:
-                # '-' not in result so unable to split into tuple;
-                # this could be from a multi-line description
-                continue
-            else:
-                name = name.strip()
-                if len(name) == 0:
-                    continue
-                packages[name] = description.split(six.u('<br'), 1)[0].strip()
-        return packages
+        return self.pip.search(term)
 
     def search_names(self, term):
         return list(self.search(term).keys())
@@ -253,8 +199,8 @@ class VirtualEnvironment(object):
         List of all packages that are installed in this environment in
         the format [(name, ver), ..].
         """
-        return list(map(split_package_name, filter(None, self._execute(
-                [self._pip_rpath, 'freeze', '-l']).split(linesep))))
+        output, _ = self.pip._execute(['freeze', '-l'])
+        return list(map(split_package_name, filter(None, output).split(linesep)))
 
     @property
     def installed_package_names(self):
